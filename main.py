@@ -1,94 +1,135 @@
 import os
-import uuid
+import uvicorn
 import yt_dlp
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from openai import OpenAI
+import asyncio
 import edge_tts
+from fastapi import FastAPI
+from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------
+# LANGUAGE → VOICE MAPPING
+# ---------------------------
+VOICE_MAP = {
+    "hindi": "hi-IN-SwaraNeural",
+    "english": "en-US-JennyNeural",
+    "arabic": "ar-EG-SalmaNeural",
+    "japanese": "ja-JP-NanamiNeural",
+    "korean": "ko-KR-SunHiNeural",
+    "tamil": "ta-IN-PriyaNeural"
+}
 
+DEFAULT_VOICE = os.getenv("EDGE_TTS_VOICE", "hi-IN-SwaraNeural")
+
+
+# ---------------------------
+# REQUEST MODEL
+# ---------------------------
 class DubRequest(BaseModel):
-    video_url: str
-    target_language: str
+    url: str
+    language: str
 
 
-@app.post("/dub")
-async def dub_video(req: DubRequest):
-    url = req.video_url
-    lang = req.target_language.lower()
-
-    audio_filename = f"input_{uuid.uuid4()}.mp3"
-    output_audio = f"output_{uuid.uuid4()}.mp3"
-
-    # 1️⃣ DOWNLOAD YOUTUBE AUDIO (NO COOKIES NEEDED)
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": audio_filename,
-        "noplaylist": True,
-    }
-
+# ---------------------------
+# YOUTUBE AUDIO DOWNLOAD
+# ---------------------------
+def download_audio(url):
     try:
+        filename = "input_audio.mp3"
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": filename,
+            "quiet": True
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+        return filename
     except Exception as e:
-        return {"error": f"Audio download failed: {str(e)}"}
+        print("Download Error:", e)
+        return None
 
-    # 2️⃣ TRANSCRIBE WITH EMOTIONS (Whisper v3 large)
-    try:
+
+# ---------------------------
+# WHISPER TRANSCRIPTION
+# ---------------------------
+def transcribe_audio(filepath):
+    with open(filepath, "rb") as f:
         transcript = client.audio.transcriptions.create(
-            file=open(audio_filename, "rb"),
-            model="gpt-4o-mini-transcribe",
-            response_format="verbose_json"
+            model="gpt-4o-mini-tts",
+            file=f
         )
-        original_text = transcript.text
-    except Exception as e:
-        return {"error": f"Transcription failed: {str(e)}"}
+    return transcript.text
 
-    # 3️⃣ TRANSLATE WITH EMOTION PRESERVATION
-    try:
-        translation = client.responses.create(
-            model="gpt-4o-mini",
-            input=f"""
-            Translate to {lang}.
-            Keep ALL emotions exactly same (happy/sad/excited/angry).
-            Text: {original_text}
-            """
-        )
-        translated = translation.output[0].content[0].text
-    except Exception as e:
-        return {"error": f"Translation failed: {str(e)}"}
 
-    # 4️⃣ EMOTIONAL TTS
-    VOICES = {
-        "english": "en-US-JennyNeural",
-        "hindi": "hi-IN-SwaraNeural",
-        "japanese": "ja-JP-NanamiNeural",
-        "korean": "ko-KR-SunHiNeural",
-        "arabic": "ar-EG-SalmaNeural",
-    }
+# ---------------------------
+# TRANSLATE USING GPT-4
+# ---------------------------
+def translate_text(text, target_lang):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": f"Translate text to {target_lang}. Maintain original emotions and tone."},
+            {"role": "user", "content": text}
+        ]
+    )
+    return response.choices[0].message.content
 
-    if lang not in VOICES:
-        return {"error": "Language not supported"}
 
-    try:
-        tts = edge_tts.Communicate(translated, VOICES[lang])
-        await tts.save(output_audio)
-    except Exception as e:
-        return {"error": f"TTS failed: {str(e)}"}
+# ---------------------------
+# GENERATE DUBBED AUDIO
+# ---------------------------
+async def synthesize_voice(text, lang):
+    voice = VOICE_MAP.get(lang.lower(), DEFAULT_VOICE)
+    output_file = "dubbed_audio.mp3"
 
-    return {
-        "status": "success",
-        "audio_url": f"https://global-dub-backend.onrender.com/{output_audio}"
-    }
+    tts = edge_tts.Communicate(text, voice)
+    await tts.save(output_file)
+
+    return output_file
+
+
+# ---------------------------
+# MAIN PROCESSING API
+# ---------------------------
+@app.post("/dub")
+async def dub_video(req: DubRequest):
+    video_url = req.url
+    target_language = req.language.lower()
+
+    # 1) DOWNLOAD AUDIO
+    audio_path = download_audio(video_url)
+    if not audio_path:
+        return {"error": "Failed to download video."}
+
+    # 2) TRANSCRIBE
+    original_text = transcribe_audio(audio_path)
+
+    # 3) TRANSLATE
+    translated_text = translate_text(original_text, target_language)
+
+    # 4) TTS
+    dubbed_audio = await synthesize_voice(translated_text, target_language)
+
+    return FileResponse(
+        dubbed_audio,
+        media_type="audio/mpeg",
+        filename="dubbed_audio.mp3"
+    )
+
+
+# ---------------------------
+# ROOT CHECK
+# ---------------------------
+@app.get("/")
+def home():
+    return {"status": "Backend Running Successfully!"}
+
+
+# Run local
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=10000)
